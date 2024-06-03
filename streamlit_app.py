@@ -1,110 +1,426 @@
-import streamlit as st 
-import pandas as pd
+import streamlit as st
+import re
+import json
+import random
+import boto3
+import npc_seeds
+import shoplifting
+import chaos_events
+from enum import Enum
+from pathlib import Path
+import configparser
 
-st.balloons()
-st.markdown("# Data Evaluation App")
+class Personas(Enum):
+    judge       = 1
+    prosecutor  = 2
+    defendant   = 3
+    witness     = 4
+    audience    = 5
 
-st.write("We are so glad to see you here. ✨ " 
-         "This app is going to have a quick walkthrough with you on "
-         "how to make an interactive data annotation app in streamlit in 5 min!")
 
-st.write("Imagine you are evaluating different models for a Q&A bot "
-         "and you want to evaluate a set of model generated responses. "
-        "You have collected some user data. "
-         "Here is a sample question and response set.")
+class Agent:
 
-data = {
-    "Questions": 
-        ["Who invented the internet?"
-        , "What causes the Northern Lights?"
-        , "Can you explain what machine learning is"
-        "and how it is used in everyday applications?"
-        , "How do penguins fly?"
-    ],           
-    "Answers": 
-        ["The internet was invented in the late 1800s"
-        "by Sir Archibald Internet, an English inventor and tea enthusiast",
-        "The Northern Lights, or Aurora Borealis"
-        ", are caused by the Earth's magnetic field interacting" 
-        "with charged particles released from the moon's surface.",
-        "Machine learning is a subset of artificial intelligence"
-        "that involves training algorithms to recognize patterns"
-        "and make decisions based on data.",
-        " Penguins are unique among birds because they can fly underwater. "
-        "Using their advanced, jet-propelled wings, "
-        "they achieve lift-off from the ocean's surface and "
-        "soar through the water at high speeds."
-    ]
-}
+    def __init__(self):
+        self.case = 'shoplifting'    # Imported case
+        self.difficulty_level = 1.0  # Chaos sampling probability
+        self.language = 'English'    # English or Swedish
+        self.current_folder = Path(__file__).parent.resolve()               # Current path
+        self.memory_buffer = f'{self.current_folder}/memory_buffer.json'    # Buffer of past prompts and chaos events
+        self.npc_memory = Personas._member_names_                           # Individual npc memories (evolve in real time)
+        self.emotions = {npc: 'calm' for npc in self.npc_memory}            # Initialize emotional VR tags
+        self.seed = {}
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        self.region = config['aws']['region']
+        self.model = config['bedrock']['model']
+        self.aws_access_key_id = 'AKIA5FTZAELWAIDHCNHG'
+        self.aws_secret_access_key = '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'
+        #self.aws_access_key_id = config['credentials']['access_key']
+        #self.aws_secret_access_key = config['credentials']['secret_access_key']
 
-df = pd.DataFrame(data)
+        st.title("Sweden Court GenAI for VR :hatched_chick:")
+        
+    def send(self, message: str, npc_identity: str):
+        ''' Send message to game server'''
+        with st.chat_message(npc_identity):
+            st.markdown(message)
+        #print(f'<{npc_identity}>: {message}')
 
-st.write(df)
+    def on_message(self):
+        ''' Receive message from game server'''
+        message = st.chat_input("Powered by Bedrock")
+        #message = input("Enter player's message: ")
+        return message
 
-st.write("Now I want to evaluate the responses from my model. "
-         "One way to achieve this is to use the very powerful `st.data_editor` feature. "
-         "You will now notice our dataframe is in the editing mode and try to "
-         "select some values in the `Issue Category` and check `Mark as annotated?` once finished 👇")
+    def send_emotion_tags(self,  npc_identity: str,  emotion: str):
+        '''
+        Purpose:
+            Update dictionary of emotions and send it to game server
+        Input:
+            npc_identity: Identity of NPC to update
+            emotion:      Emotion of NPC to update
+        Output:
+            Dictionary of emotional VR tags for each NPC
+        '''
+        self.emotions[npc_identity] = emotion
+        print(f'<NPC emotions updated>: {self.emotions}')  #return-to game server
 
-df["Issue"] = [True, True, True, False]
-df['Category'] = ["Accuracy", "Accuracy", "Completeness", ""]
+    def promptEngineer(self):
+        '''
+        Purpose:
+            Create Interpreter's system prompt
+        Output:
+            final_prompt: Interpreter's system prompt
+        '''
+        final_prompt = f"""
+                    The assistant interpret the user's prompt by creating tags, or just create the tag <previous>.
+                    The assistant only creates tags, it doesn't respond anything else. 
+                    If the user talks to the defendant, then the assistant creates the following tag: <defendant>.
+                    If the user talks to the prosecutor, then the assistant creates the following tag: <prosecutor>.
+                    If the user talks to the judge, then the assistant creates the following tag: <judge>.
+                    If the user talks to the witness, then the assistant creates the following tag: <witness>.
+                    If the user talks to the audience, then the assistant creates the following tag: <audience>.
+                    If the user asks the prosecutor to ask questions to the defendant, then the assistant creates the following tag: <self_defendant_prosecutor>.        
+                    If the user asks the prosecutor to ask questions to the witness, then the assistant creates the following tag: <self_witness_prosecutor>.   
+                    If the user asks the defendant to ask questions to the prosecutor, then the assistant creates the following tag: <self_prosecutor_defendant>. 
+                    If the user asks the defendant to ask questions to the witness, then the assistant creates the following tag: <self_witness_defendant>.     
+                    If the assistant does not know what tag to create, the assistant does not respond, instead it creates the following tag: <previous>.
+                    """
+        return final_prompt
 
-new_df = st.data_editor(
-    df,
-    column_config = {
-        "Questions":st.column_config.TextColumn(
-            width = "medium",
-            disabled=True
-        ),
-        "Answers":st.column_config.TextColumn(
-            width = "medium",
-            disabled=True
-        ),
-        "Issue":st.column_config.CheckboxColumn(
-            "Mark as annotated?",
-            default = False
-        ),
-        "Category":st.column_config.SelectboxColumn
-        (
-        "Issue Category",
-        help = "select the category",
-        options = ['Accuracy', 'Relevance', 'Coherence', 'Bias', 'Completeness'],
-        required = False
-        )
-    }
-)
+    def get_interpreter(self, input_text):
+        '''
+        Purpose:
+            Invoke LLM with interpreter system prompt + user prompt
+        Input:
+            input_text: Player's actual utterance
+        Output:
+            response: NPC tag generated by the interpreter
+        '''
 
-st.write("You will notice that we changed our dataframe and added new data. "
-         "Now it is time to visualize what we have annotated!")
+        # Prepare system prompt
+        system_prompt = self.promptEngineer()
 
-st.divider()
+        # Claude v3 Sonnet
+        body = json.dumps({
+            "system": system_prompt,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": input_text}]
+                }
+            ],
+            "temperature": 0,
+            "top_p": 1,
+            "max_tokens": 300,
+            "anthropic_version": "bedrock-2023-05-31"
+        })
+        bedrock_runtime = boto3.client(region_name=self.region,
+                                       service_name='bedrock-runtime',
+                                        aws_access_key_id = self.aws_access_key_id,
+                                        aws_secret_access_key = self.aws_secret_access_key)
+        response = bedrock_runtime.invoke_model(body=body,
+                                                modelId=self.model)
 
-st.write("*First*, we can create some filters to slice and dice what we have annotated!")
+        response_body = json.loads(response.get('body').read())
+        return response_body["content"][0]["text"]
 
-col1, col2 = st.columns([1,1])
-with col1:
-    issue_filter = st.selectbox("Issues or Non-issues", options = new_df.Issue.unique())
-with col2:
-    category_filter = st.selectbox("Choose a category", options  = new_df[new_df["Issue"]==issue_filter].Category.unique())
+    def get_npc_prompt(self, tag, case, language, difficulty_level, previous_prompt, previous_identity, events):
+        '''
+        Purpose:
+            Define NPC identity (seed memory) and behaviors (procedures and chaos events)
+            Map interpreter tag to NPC system prompt and chaos events
+            Any unaddressed utterance goes to the previously selected NPC
+        Input:
+            tag:                Tag generated by the interpreter
+            case:               Name of judicial case (only "shoplifting" in prototype)
+            language:           Language of LLM's responses (English or Swedish)
+            difficulty_level:   Probability of sampling a chaos event at every turn
+            previous_prompt:    Previous NPC prompt (redundant, will be eliminated in future version)
+            previous_identity:  Previous NPC identity
+            events:             Previous chaos events
+        Output:
+            response:           System prompt for NPC engaged by player, and list of chaos events
+        '''
 
-st.dataframe(new_df[(new_df['Issue'] == issue_filter) & (new_df['Category'] == category_filter)])
+        # Get seed memory, case data and chaos events from external library
+        npc_seed = npc_seeds.get_npc_seed(language, case)
+        regular_procedure = shoplifting.get_procedure()
+        chaos_event = chaos_events.get_chaos_event()
 
-st.markdown("")
-st.write("*Next*, we can visualize our data quickly using `st.metrics` and `st.bar_plot`")
+        # Defendant's system prompt
+        self.seed['defendant'] = (npc_seed['defendant'] + regular_procedure['plea_defendant'] + regular_procedure[
+            'version_of_events_defendant'] + regular_procedure['background_defendant']
+                                 + regular_procedure['income_and_family_defendant'] + regular_procedure[
+                                     'closing_statement_defendant'])
 
-issue_cnt = len(new_df[new_df['Issue']==True])
-total_cnt = len(new_df)
-issue_perc = f"{issue_cnt/total_cnt*100:.0f}%"
+        # Prosecutor's system prompt
+        self.seed['prosecutor'] = npc_seed['prosecutor'] + regular_procedure['claim_prosecutor'] + regular_procedure[
+            'version_of_events_prosecutor'] + regular_procedure['closing_statement_prosecutor']
 
-col1, col2 = st.columns([1,1])
-with col1:
-    st.metric("Number of responses",issue_cnt)
-with col2:
-    st.metric("Annotation Progress", issue_perc)
+        # Lay judge's system prompt
+        self.seed['judge'] = npc_seed['judge']
 
-df_plot = new_df[new_df['Category']!=''].Category.value_counts().reset_index()
+        # Witness' system prompt
+        self.seed['witness'] = npc_seed['witness'] + regular_procedure['witness']
 
-st.bar_chart(df_plot, x = 'Category', y = 'count')
+        # Audience member's system prompt
+        self.seed['audience'] = npc_seed['audience']
 
-st.write("Here we are at the end of getting started with streamlit! Happy Streamlit-ing! :balloon:")
+        # Identify which NPC is invoked by the player
+        tag_string = self.get_tag_string(tag)
+        if tag_string == 'previous':
+            npc_identity = previous_identity
+            npc_prompt = previous_prompt
+        elif 'self' in tag_string:
+            npc_identity = self.get_event_identity(tag_string)
+            npc_prompt = self.seed[npc_identity]
+        else:
+            try:
+                npc_identity = tag_string
+                npc_prompt = self.seed[npc_identity]
+            except:
+                npc_prompt = None
+                npc_identity = None
 
+        # Select chaos event procedural prompt
+        random_number = random.random()
+        if random_number < difficulty_level and npc_prompt is not None:
+
+            # Select a chaos event randomly
+            event = random.choice(list(chaos_event.keys()))
+
+            # Sample without replacement (to do: stop chaos when solved)
+            if event not in events:
+                events.append(event)
+            else:
+                print(f'\n=== MONITORING === Sampled chaos event already in list: {event}')
+
+            # Update emotional VR tags
+            if (event == 'afraid_nervous_witness' or event == 'intoxicated_defendant'):
+                self.send_emotion_tags(self.get_event_identity(event),self.get_event_emotion(event))
+
+        # Define identity of NPC involved in chaos and merge to NPC engaged with player
+        for event in events:
+            identity_event = self.get_event_identity(event)
+            if identity_event == npc_identity:
+                npc_prompt = npc_prompt + chaos_event[event]
+
+        return npc_prompt, npc_identity, events
+
+    def get_tag_string(self, tag):
+        ''' Retrieve string inside tag quotes <string> '''
+        return tag[1:-1]
+
+    def get_event_identity(self, event):
+        ''' Retrieve identity of NPC impacted by event '''
+        return event.split("_")[-1]
+
+    def get_event_emotion(self, event):
+        ''' Retrieve emotion of NPC impacted by event '''
+        return event.split("_")[-2]
+
+    def get_event_instruction(self, event):
+        ''' Retrieve system prompt for NPC engaged in chaos events '''
+        chaos_event = chaos_events.get_chaos_event()
+        return chaos_event[event]
+
+    def get_npc_response(self, system_prompt, input_text, memory):
+        '''
+        Purpose:
+            Invoke Claude v3 from Bedrock with a system prompt + user prompt + memory
+        Input:
+            system_prompt: System prompt defining identity and behavior of a NPC
+            input_text: Player's actual utterance
+            memory: Memory specific to each NPC (updated as global variable using aliasing)
+        Output:
+            response: Response from the LLM
+        '''
+
+        # Claude v3 Sonnet
+        new_message = {
+            "role": "user",
+            "content": [{"type": "text", "text": input_text}]
+        }
+
+        # Append user input to memory of this NPC (it's an alias, no cloning, TBC in OOP)
+        memory.append(new_message)
+
+        body = json.dumps({
+            "system": system_prompt,
+            "messages": memory,
+            "temperature": 0.5,
+            "top_p": 1,
+            "max_tokens": 300,
+            "anthropic_version": "bedrock-2023-05-31"
+        })
+        bedrock_runtime = boto3.client(region_name=self.region,
+                                       service_name='bedrock-runtime',
+                                        aws_access_key_id = self.aws_access_key_id,
+                                        aws_secret_access_key = self.aws_secret_access_key)
+        response = bedrock_runtime.invoke_model(body=body,
+                                                modelId=self.model)
+        response_body = json.loads(response.get('body').read())
+        response_text = response_body["content"][0]["text"]
+        new_message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": response_text}]
+        }
+        # Append NPC response to memory of this NPC (it's an alias, no cloning)
+        memory.append(new_message)
+
+        return response_text
+
+    def npc_self_interaction(self, tag_interpreter, input_text, memory):
+        '''
+        Purpose:
+            This is a simple version of NPC-NPC interaction (Sasha's code could come here)
+        Input:
+            tag_interpreter: Tag defining identity of the two NPC engaged in this dialogue
+            input_text:      Player's utterance
+            memory:          Dictionary of memories for all NPC
+        Output:
+            N/A (handle back to player)
+        '''
+
+        # Define the two characters
+        npc_pair = self.get_tag_string(tag_interpreter)
+        npc1 = npc_pair.split("_")[-1]
+        npc2 = npc_pair.split("_")[-2]
+
+        npc_identity = npc1
+
+        while npc_identity != Personas.judge.name:
+            print(f'=== MONITORING === NPC engaged in NPC-NPC self-interaction: {npc_identity}')
+            # Define system prompt
+            system_prompt = self.seed[npc_identity]
+            # Generate response
+            response_npc = self.get_npc_response(system_prompt, input_text, memory[npc_identity])
+            # Show on streamlit
+            self.send(response_npc, npc_identity)
+            # Save to memory
+            st.session_state.chat_history.append({"role": npc_identity, "text": response_npc})
+            for i in self.npc_memory:
+                file = f'{self.current_folder}/memory_{i}.json'
+                self.save_memory_tofile(memory[i], file)
+            # Update next npc and define exit point to give handle back to the player
+            if re.search(r'[nN]o further question', response_npc):
+                npc_identity = Personas.judge.name
+                self.send('<NPC-NPC dialogue over>', "assistant") # assistant
+                st.session_state.chat_history.append({"role": "assistant",
+                                                     "text": '<NPC-NPC dialogue over>'})
+            else:
+                if npc_identity == npc1:
+                    npc_identity = npc2
+                else:
+                    npc_identity = npc1
+                # Update input text to next npc
+                input_text = response_npc
+
+
+    def save_memory_tofile(self, memory, file):
+        with open(file, 'w') as f:
+            json.dump(memory, f)
+
+    def load_memory_fromfile(self, file):
+        with open(file, 'r') as f:
+            memory = json.load(f)
+        return memory
+
+    def speaks_to_player(self):
+
+        # Load NPC memories from file and streamlit chat history, or initialize if none exists yet
+        memory = {}
+        if 'chat_history' not in st.session_state:
+            st.session_state.chat_history = []
+            buffer = {"npc_prompt": [''], "npc_identity": None, "events": []}
+            self.save_memory_tofile(buffer, self.memory_buffer)
+            for i in self.npc_memory:
+                file = f'{self.current_folder}/memory_{i}.json'
+                self.save_memory_tofile([], file)
+        else:
+            buffer = self.load_memory_fromfile(self.memory_buffer)
+            for i in self.npc_memory:
+                file = f'{self.current_folder}/memory_{i}.json'
+                memory[i] = self.load_memory_fromfile(file)
+
+        # Show all messages from history on the user interface
+        #for message in st.session_state.chat_history:
+        #    self.send(message["text"], message["role"])
+
+        # Wait for game server to send player input
+        input_text = self.on_message()
+
+        if input_text:
+
+            self.send(input_text, "user")
+            #st.session_state.chat_history.append({"role": "user", "text": input_text})
+
+            # Invoke LLM with interpreter system prompt + user prompt
+            tag_interpreter = self.get_interpreter(input_text)
+
+            self.send(tag_interpreter, "assistant")
+            #st.session_state.chat_history.append({"role": "assistant", "text": tag_interpreter})
+
+            # Map interpreter tag to procedural prompt(s) and invoke LLM with procedural prompt(s)
+            npc_prompt, npc_identity, events = self.get_npc_prompt(tag_interpreter, self.case, self.language,
+                                                                   self.difficulty_level, buffer["npc_prompt"][0],
+                                                                   buffer["npc_identity"], buffer["events"])
+
+            # Save latest procedural step and event in buffer
+            buffer["npc_prompt"] = npc_prompt
+            buffer["npc_identity"] = npc_identity
+            buffer["events"] = events  # list
+            self.save_memory_tofile(buffer, self.memory_buffer)
+
+            # If player authorized a dialogue between NPCs, redirect toward NPC-NPC autonomous dialogue
+            if 'self' in self.get_tag_string(tag_interpreter):
+                self.npc_self_interaction(tag_interpreter, input_text, memory)
+
+            # Else get a response from the NPC engaged by the player
+            elif npc_prompt is not None:
+                print(f'\n=== MONITORING === NPC engaged by Player: {npc_identity}')
+                print(f'***DEBUGGING| npc_prompt: {npc_prompt}')
+                print(f'***DEBUGGING| input_text: {input_text}')
+                print(f'***DEBUGGING| memory[npc_identity]: {memory[npc_identity]}')
+                response_npc = self.get_npc_response(npc_prompt,
+                                                     input_text, memory[npc_identity])
+                self.send(response_npc, npc_identity)
+
+                # Save to memory
+                #st.session_state.chat_history.append({"role": npc_identity, "text": response_npc})
+                for i in self.npc_memory:
+                    file = f'{self.current_folder}/memory_{i}.json'
+                    self.save_memory_tofile(memory[i], file)
+
+            print(f'=== MONITORING === List of all ongoing events: {events}')
+
+            if events:
+                for event in events:
+
+                    # Get identity of NPC for this chaos event
+                    identity_event = self.get_event_identity(event)
+
+                    # Get system prompt for this chaos event
+                    event_instruction = self.get_event_instruction(event)
+
+                    # Test if chaos is already merged to currently engaged NPC, or is a separate event
+                    # (does not allow prosecutor/defendant/witness to engage when not their turn to talk)
+                    if (identity_event != npc_identity) & (identity_event == 'audience' or identity_event == 'judge'):
+                        print(f'=== MONITORING === Chaos from {identity_event} proceeding')
+                        chaos_response = self.get_npc_response(event_instruction, 'Hmm', memory[
+                            identity_event])  # 'Hmm' is just a tag used to indicate player is not saying anything ot NPC
+                        self.send(f"<{identity_event}> (chaos event)\n\n{chaos_response}", identity_event)
+                        #st.session_state.chat_history.append(
+                        #    {"role": identity_event, "text": f"<{identity_event}> (chaos event)\n\n{chaos_response}"})
+                        #self.send(chaos_response, identity_event)
+                        # Not saved to memory because player is not interacting with this NPC at that moment
+                    elif (event == 'afraid_nervous_witness' or event == 'intoxicated_defendant'):
+                        print(f'<VR emotional tag>: {event}')
+                    else:
+                        print(f'=== MONITORING === Chaos ({event}) already engaged or waiting for its turn to speak.')
+
+
+if __name__ == '__main__':
+    sim = Agent()
+    sim.speaks_to_player()
